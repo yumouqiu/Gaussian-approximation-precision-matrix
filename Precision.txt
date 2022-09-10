@@ -1,0 +1,288 @@
+library(lars)
+library(MASS)
+library(genlasso)
+library(scalreg)
+
+#---AR covariance structure---
+
+ARcov = function(p, rho){
+    Cov = matrix(0, p, p)
+    for (i in 1 : p){
+        for (j in 1 : p){
+            Cov[i, j] = rho^(abs(i - j))
+        }
+    }
+    return(Cov)
+}
+
+#---Block diagonal covariance structure---
+
+BD = function(p, k, tau2, rho){
+	# k is the number of blocks
+	C = matrix(0, p, p)
+	d = p / k
+	for (m in 1 : k){
+		for (i in ((m - 1) * d + 1) : (m * d)) {
+			for (j in ((m - 1) * d + 1) : (m * d)){
+				C[i, j] = rho
+			}	
+		}
+	}
+	Cov = C + diag(tau2 - rho, p)
+	return(Cov)
+}
+
+#---Block banded (bandwidth 3) precision structure---
+
+block = function(p, k, tau2, rho, rho1){
+	# k is the number of blocks
+	C = matrix(0, p, p)
+	d = p / k
+	for (m in 1 : k){
+		for (i in ((m - 1) * d + 1) : (m * d)) {
+			for (j in ((m - 1) * d + 1) : (m * d)){
+				C[i, j] = rho
+			}	
+		}
+	}
+	for (m1 in 1 : (k - 1)){
+		m2 = m1 + 1
+		for (i in ((m1 - 1) * d + 1) : (m1 * d)) {
+			for (j in ((m2 - 1) * d + 1) : (m2 * d)){
+				C[i, j] = rho1
+			}	
+		}
+	}
+	for (m1 in 2 : k){
+		m2 = m1 - 1
+		for (i in ((m1 - 1) * d + 1) : (m1 * d)) {
+			for (j in ((m2 - 1) * d + 1) : (m2 * d)){
+				C[i, j] = rho1
+			}	
+		}
+	}
+	Omega = C + diag(tau2 - rho, p)
+	return(Omega)
+}
+
+
+QS = function(u){
+if (u == 0) ker = 1
+else ker = 25 * ( sin(6 * pi * u / 5) / (6 * pi * u / 5) - cos(6 * pi * u / 5) ) / (12 * pi^2 * u^2)
+return(ker)
+}
+
+
+#--------------------------------------------------------------------------------------------------
+
+BTDistKernelAR1 = function(n, p, Sigma, rho, smax = n / 2, R = 1000, M = 3000){
+#- Test for AR1 structure; 
+#- R is the number of repetitions; 
+#- smax is the maximum number of non-zero element in lasso estimation (except diagonal); 
+#- M is the number of bootstraps
+
+result = matrix(0, R, (M + 2))
+precisionMatrix = solve(Sigma)
+for (rep in 1 : R){
+	X = matrix(0, n, p)
+	Epsilon = mvrnorm(n, rep(0, p), Sigma)
+	X[1, ] = Epsilon[1, ]
+	for (i in 2 : n){
+		X[i, ] = rho * X[i - 1, ] + sqrt(1 - rho^2) * Epsilon[i, ]
+	}
+	Eresidual = matrix(0, n, p)
+	CoefMatrix = matrix(0, p, p - 1)
+	meanX = colMeans(X)
+	X = t(t(X) - meanX)
+        for (i in 1 : p){
+		out = scalreg(X = X[, -i], y = X[, i], lam0 = sqrt(2 * log(p * log(p) / sqrt(n)) / n))
+		Eresidual[, i] = out$residuals
+		CoefMatrix[i, ] = out$coefficients
+		if ( sum(abs(CoefMatrix[i, ]) > 10^(-6)) > smax ){
+			out = genlasso(X[, i], X = X[, -i], D = diag(1, p - 1))
+      			Coef = coef(out,  lambda = 2 * sqrt(var(X[, i]) * n * log(p)))
+      			Predict = predict(out, lambda = 2 * sqrt(var(X[, i]) * n * log(p)), Xnew = X[, -i])
+			CoefMatrix[i, ] = t(Coef$beta)
+			Eresidual[, i] = X[, i] - Predict$fit
+		}
+        }
+	
+	Mp = (p / 2 - 1) * (p - 1)
+        CovRes = t(Eresidual) %*% Eresidual / n
+        TestVector = matrix(0, n, (p / 2 - 1) * (p - 1))
+        BTVector = matrix(0, n, (p / 2 - 1) * (p - 1))
+	TestAlls = matrix(0, n, p * (p - 1) / 2)
+	TestAllp = matrix(0, n, p * (p - 1) / 2)
+	BTAll = matrix(0, n, p * (p - 1) / 2)
+	#Wdiag = c()
+        m = 1
+        for (i in 1 : (p - 2)){
+            for (j in (i + 2) : p){
+                TestVector[, m] = - ( Eresidual[, i] * Eresidual[, j] + Eresidual[, i]^2 * CoefMatrix[j, i] + Eresidual[, j]^2 * CoefMatrix[i, j - 1] ) / (diag(CovRes)[i] * diag(CovRes)[j])
+                BTVector[, m] = - ( Eresidual[, i] * Eresidual[, j] ) / (diag(CovRes)[i] * diag(CovRes)[j]) + mean(TestVector[, m])
+		    #Wdiag[m] = 1 / (diag(CovRes)[i] * diag(CovRes)[j])
+                m = m + 1
+            }
+        }
+        BTVectorMean = colMeans(BTVector)
+
+	BTVectorCenter = matrix(0, n, Mp)
+	for (i in 1 : n){
+		BTVectorCenter[i, ] = BTVector[i, ] - BTVectorMean
+	}
+
+	Num = 0
+	Den = 0
+	for(i in 1 : Mp){
+		AR1 = ar(BTVectorCenter[, i], aic = FALSE, order.max = 1)
+		rhoEst = AR1$ar
+		sigma2Est = AR1$var.pred
+		Num = Num + 4 * (rhoEst * sigma2Est)^2 / (1 - rhoEst)^8
+		Den = Den + sigma2Est^2 / (1 - rhoEst)^4
+	}
+	a2 = Num / Den
+	bandwidth = 1.3221 * (a2 * n)^(0.2)
+	BTcov = matrix(0, n, n)
+        for (i in 1 : n){
+		for (j in 1 : n){
+			BTcov[i, j] = QS(abs(i - j) / bandwidth)
+		}
+	}
+
+	WdiagEmp = 0
+	for (i in 1 : n){
+		WdiagEmp = WdiagEmp + BTVectorCenter[i, ]^2
+	}
+	#for (dd in 1 : (n - 1)){
+	#	tempsum = 0
+	#	for (i in (dd + 1) : n){
+	#		tempsum = tempsum + BTVectorCenter[i, ] * BTVectorCenter[i - dd, ]
+	#	}
+	#	WdiagEmp = WdiagEmp + 2 * QS(dd / bandwidth) * tempsum
+	#}
+	WdiagEmp = WdiagEmp / n
+	#Wdiag = (2 * log(n) / sqrt(n)) * Wdiag0 + (1 - 2 * log(n) / sqrt(n)) * WdiagEmp
+
+	TestStat = sqrt(n) * max(WdiagEmp^(-1/2) * abs(colMeans(TestVector)))
+
+        BT = c()
+        for (i in 1 : M){
+            	temp = mvrnorm(1, rep(0, n), BTcov)
+            	BT[i] = (n)^(-0.5) * max(WdiagEmp^(-1/2) * abs(colSums(temp * BTVectorCenter)))
+       	}
+        Q = sort(BT)[0.95 * M]
+        result[rep, ] = c(1 * (TestStat > Q), TestStat, BT)
+}
+return(result)
+}
+
+
+
+
+
+BTDistKernelBlockDiag = function(n, p, k, Sigma, rho, smax = n / 2, R = 1000, M = 3000){
+#- Test for block diagonal structure with k number of blocks on main diagonal; 
+#- R is the number of repetitions; 
+#- smax is the maximum number of non-zero element in lasso estimation (except diagonal); 
+#- M is the number of bootstraps
+
+d = p / k
+result = matrix(0, R, (M + 2))
+precisionMatrix = solve(Sigma)
+for (rep in 1 : R){
+	X = matrix(0, n, p)
+	Epsilon = mvrnorm(n, rep(0, p), Sigma)
+	X[1, ] = Epsilon[1, ]
+	for (i in 2 : n){
+		X[i, ] = rho * X[i - 1, ] + sqrt(1 - rho^2) * Epsilon[i, ]
+	}
+	Eresidual = matrix(0, n, p)
+	CoefMatrix = matrix(0, p, p - 1)
+	meanX = colMeans(X)
+	X = t(t(X) - meanX)
+        for (i in 1 : p){
+		out = scalreg(X = X[, -i], y = X[, i], lam0 = sqrt(2 * log(p * log(p) / sqrt(n)) / n))
+		Eresidual[, i] = out$residuals
+		CoefMatrix[i, ] = out$coefficients
+		if ( sum(abs(CoefMatrix[i, ]) > 10^(-6)) > smax ){
+			out = genlasso(X[, i], X = X[, -i], D = diag(1, p - 1))
+      			Coef = coef(out,  lambda = sqrt(2 * var(X[, i]) * n * log(p * log(p) / sqrt(n))))
+      			Predict = predict(out, lambda = sqrt(2 * var(X[, i]) * n * log(p * log(p) / sqrt(n))), Xnew = X[, -i])
+			CoefMatrix[i, ] = t(Coef$beta)
+			Eresidual[, i] = X[, i] - Predict$fit
+		}
+        }
+	
+        CovRes = t(Eresidual) %*% Eresidual / n
+        TestVector = matrix(0, n, (k - 1) * k * d^2 / 2)
+        BTVector = matrix(0, n, (k - 1) * k * d^2 / 2)
+	TestAlls = matrix(0, n, p * (p - 1) / 2)
+	TestAllp = matrix(0, n, p * (p - 1) / 2)
+	BTAll = matrix(0, n, p * (p - 1) / 2)
+	#Wdiag = c()
+        m = 1
+        for (blocki in 1 : (k - 1)){
+            for (blockj in (blocki + 1) : k){
+                for (i1 in 1 : d){
+                    for (j1 in 1 : d){
+                        i = (blocki - 1) * d + i1; j = (blockj - 1) * d + j1
+                        TestVector[, m] = - ( Eresidual[, i] * Eresidual[, j] + Eresidual[, i]^2 * CoefMatrix[j, i] + Eresidual[, j]^2 * CoefMatrix[i, j - 1] ) / (diag(CovRes)[i] * diag(CovRes)[j])
+                	BTVector[, m] = - ( Eresidual[, i] * Eresidual[, j] ) / (diag(CovRes)[i] * diag(CovRes)[j]) + mean(TestVector[, m])
+				#Wdiag[m] = 1 / (diag(CovRes)[i] * diag(CovRes)[j])
+                        m = m + 1
+                    }
+                }
+            }
+        }
+        BTVectorMean = colMeans(BTVector)
+	Mp = length(BTVectorMean)
+
+	BTVectorCenter = matrix(0, n, Mp)
+	for (i in 1 : n){
+		BTVectorCenter[i, ] = BTVector[i, ] - BTVectorMean
+	}
+
+	Num = 0
+	Den = 0
+	for(i in 1 : Mp){
+		AR1 = ar(BTVectorCenter[, i], aic = FALSE, order.max = 1)
+		rhoEst = AR1$ar
+		sigma2Est = AR1$var.pred
+		Num = Num + 4 * (rhoEst * sigma2Est)^2 / (1 - rhoEst)^8
+		Den = Den + sigma2Est^2 / (1 - rhoEst)^4
+	}
+	a2 = Num / Den
+	bandwidth = 1.3221 * (a2 * n)^(0.2)
+	BTcov = matrix(0, n, n)
+        for (i in 1 : n){
+		for (j in 1 : n){
+			BTcov[i, j] = QS(abs(i - j) / bandwidth)
+		}
+	}
+
+	WdiagEmp = 0
+	for (i in 1 : n){
+		WdiagEmp = WdiagEmp + BTVectorCenter[i, ]^2
+	}
+	#for (dd in 1 : (n - 1)){
+	#	tempsum = 0
+	#	for (i in (dd + 1) : n){
+	#		tempsum = tempsum + BTVectorCenter[i, ] * BTVectorCenter[i - dd, ]
+	#	}
+	#	WdiagEmp = WdiagEmp + 2 * QS(dd / bandwidth) * tempsum
+	#}
+	WdiagEmp = WdiagEmp / n
+	#Wdiag = (2 * log(n) / sqrt(n)) * Wdiag0 + (1 - 2 * log(n) / sqrt(n)) * WdiagEmp
+
+	TestStat = sqrt(n) * max(WdiagEmp^(-1/2) * abs(colMeans(TestVector)))
+
+        BT = c()
+        for (i in 1 : M){
+            	temp = mvrnorm(1, rep(0, n), BTcov)
+            	BT[i] = (n)^(-0.5) * max(WdiagEmp^(-1/2) * abs(colSums(temp * BTVectorCenter)))
+       	}
+        Q = sort(BT)[0.95 * M]
+        result[rep, ] = c(1 * (TestStat > Q), TestStat, BT)
+}
+return(result)
+}
